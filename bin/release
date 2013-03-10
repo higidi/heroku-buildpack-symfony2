@@ -3,7 +3,11 @@
 
 cat <<EOF
 ---
+addons:
+  - scheduler:standard
+config_vars:
+  PATH: /app/bin:/usr/local/bin:/usr/bin:/bin
+  GEM_HOME: /app/vendor/.gem
 default_process_types:
-  web: sh boot.sh
+  web: bash web.sh
 EOF
-
