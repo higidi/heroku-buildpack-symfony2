@@ -1,66 +1,249 @@
 #!/usr/bin/env bash
 # bin/compile <build-dir> <cache-dir>
 
-# fail fast
-set -e
+# ----START CONFIG-----------------------------------------------------
+S3_BUCKET="php-lp"
+S3_URL="https://s3.amazonaws.com/$S3_BUCKET"
 
-# config
-APACHE_VERSION="2.2.22"
-APACHE_PATH="apache"
 PHP_VERSION="5.3.10"
 PHP_PATH="php"
+PHP_MODULES="apc curl mysql mysqli mysqlnd pdo pdo_mysql"
 
-BIN_DIR=$(dirname $0)
+APACHE_VERSION="2.2.22"
+APACHE_PATH="apache"
+
+# ----Local folders----
 BUILD_DIR=$1
 CACHE_DIR=$2
+BIN_DIR="$BUILD_DIR/bin"
+VENDOR_DIR="$BUILD_DIR"
+WWW_DIR="$BUILD_DIR/www"
 LP_DIR=`cd $(dirname $0); cd ..; pwd`
+LP_BIN_DIR="$LP_DIR/bin"
+LP_LIB_DIR="$LP_DIR/lib"
 
-# include .files when moving things around
-shopt -s dotglob
+export LANG=en_US.UTF-8
 
+# ---- Include libs ----
+. $LP_LIB_DIR/functions.bash
+
+# ---- PREPARE BUILD ----
+echo "-----> Slug compilation start"
+
+# fail fast
+set -e
+set -o pipefail
+
+#echo "-----> Build dir: $BUILD_DIR"
+#ls -la $BUILD_DIR | indent
+#echo "-----> Cache dir: $CACHE_DIR"
+
+# create local folders
+echo "-----> Prepare filesystem structure"
+mkdir -p $BUILD_DIR $CACHE_DIR
 cd $BUILD_DIR
 
-# move app things to www
+echo -n "-> Move application files into 'www' folder ... " | indent
+shopt -s dotglob
 mkdir -p $CACHE_DIR/www
 mv * $CACHE_DIR/www
 mv $CACHE_DIR/www .
+shopt -u dotglob
+echo "done"
 
 # keep Procfile
 if [ -f www/Procfile ]; then
-  mv www/Procfile .
+	mv www/Procfile .
 fi
 
-APACHE_URL="https://s3.amazonaws.com/php-lp/apache-$APACHE_VERSION.tar.gz"
-echo "-----> Bundling Apache version $APACHE_VERSION"
-curl --silent --max-time 60 --location "$APACHE_URL" | tar xz
+# bin/vendor folder
+echo -n "-> bin folder ... " | indent
+if [ ! -d $BIN_DIR ]
+then
+	mkdir $BIN_DIR
+	echo "done"
+else
+	echo "exists"
+fi
+echo -n "-> vendor folder ... " | indent
+if [ ! -d $VENDOR_DIR ]; then
+	mkdir $VENDOR_DIR
+	echo "done"
+else
+	echo "exists"
+fi
 
-PHP_URL="https://s3.amazonaws.com/php-lp/php-$PHP_VERSION.tar.gz"
-echo "-----> Bundling PHP version $PHP_VERSION"
-curl --silent --max-time 60 --location "$PHP_URL" | tar xz
+# ----INSTALL SERVICES----
+echo "-----> Installing Services"
+cd $VENDOR_DIR
 
-# update config files
-cp $LP_DIR/conf/httpd.conf $APACHE_PATH/conf
-cp $LP_DIR/conf/php.ini php
+# ----Apache----
+if [ ! -d $APACHE_PATH ]
+then
+	echo "-> Bundling Apache: v$APACHE_VERSION" | indent
+	APACHE_URL="$S3_URL/apache-$APACHE_VERSION.tar.gz"
+	curl --silent --max-time 60 --location "$APACHE_URL" | tar xz
 
-# make php available on bin
-mkdir -p bin
-ln -s /app/php/bin/php bin/php
+	cp -f $LP_DIR/conf/httpd.conf $VENDOR_DIR/apache/conf/httpd.conf
+fi
 
-cat >>boot.sh <<EOF
+# ----PHP----
+if [ ! -d $PHP_PATH ]
+then
+	echo "-> Bundling PHP-FPM: v$PHP_VERSION" | indent
+	PHP_URL="$S3_URL/php-$PHP_VERSION.tar.gz"
+	curl --silent --max-time 60 --location "$PHP_URL" | tar xz
+
+	pushd $VENDOR_DIR/$PHP_PATH/ext > /dev/null
+	curl --silent --max-time 60 --location "https://s3.amazonaws.com/rs-heroku-builds/php-5.3.10-exts.tar.gz" | tar xz
+	popd > /dev/null
+
+	ln -s /app/php/bin/php $BUILD_DIR/bin/php
+
+	# need until build completes
+	export LD_LIBRARY_PATH="$VENDOR_DIR/php/ext:$LD_LIBRARY_PATH"
+	export PHPRC="$VENDOR_DIR"/php/etc
+
+	cp -f $LP_DIR/conf/php.ini $VENDOR_DIR/php/php.ini
+fi
+
+# ---- Composer ----
+if [ -f $WWW_DIR/composer.json ]
+then
+	pushd $WWW_DIR > /dev/null
+	echo "-----> Installing dependencies using Composer"
+	GIT_DIR_ORIG=${GIT_DIR}
+	unset GIT_DIR
+
+	if [ ! -f "composer.phar" ]
+	then
+		echo -n "-> Fetching composer ... " | indent
+		COMPOSER_URL="http://getcomposer.org/composer.phar"
+		curl --silent -O --max-time 60 --location ${COMPOSER_URL}
+		echo "done"
+	fi
+
+	# do the deed!
+	echo "-> Run install ..." | indent
+	LD_LIBRARY_PATH=$VENDOR_DIR/php/ext ${VENDOR_DIR}/php/bin/php -d date.timezone=UTC -d extension_dir=$VENDOR_DIR/php/ext -d extension=$VENDOR_DIR/php/ext/mbstring.so -d extension=$VENDOR_DIR/php/ext/zlib.so composer.phar install -n --prefer-source --no-scripts | indent 8
+
+	export GIT_DIR=${GIT_DIR_ORIG}
+
+	popd > /dev/null
+fi
+
+# ---- SASS/Compass ----
+# ruby gems
+pushd $VENDOR_DIR > /dev/null
+if [ ! -d $VENDOR_DIR/.gem ]; then
+  mkdir $VENDOR_DIR/.gem
+fi
+export GEM_PATH=$GEM_PATH:$VENDOR_DIR/.gem
+echo "-----> Bundling SASS"
+gem install sass --no-rdoc --no-ri --install-dir "$VENDOR_DIR/.gem" | indent 8
+ln -s ../vendor/.gem/bin/sass $BIN_DIR/sass
+echo "-----> Bundling Compass"
+gem install compass --no-rdoc --no-ri --install-dir "$VENDOR_DIR/.gem" | indent 8
+ln -s ../vendor/.gem/bin/compass $BIN_DIR/compass
+echo "-----> Compiling SASS/COMPASS ..."
+for c_project in $(find $WWW_DIR -type f -name 'config.rb'); do
+	c_project=$(dirname $c_project)
+	echo "Project: $c_project" | indent 10
+	GEM_HOME=$VENDOR_DIR/.gem /$VENDOR_DIR/.gem/bin/compass compile -s compressed -e production $c_project | indent 12
+done
+popd > /dev/null
+
+
+# ---- Symfony ----
+echo "-----> Preparing Symfony2"
+
+pushd $BUILD_DIR > /dev/null
+echo -n "-> Linking sf2 CLI to bin/sf2 ... " | indent
+cat >>bin/sf2 <<EOF
+#!/usr/bin/env bash
+/app/env.sh
+LD_LIBRARY_PATH="/app/php/ext:$LD_LIBRARY_PATH" /app/bin/php /app/www/app/console \$@
+EOF
+chmod +x bin/sf2
+echo "done"
+popd > /dev/null
+
+pushd $WWW_DIR > /dev/null
+echo "-> Build Boostrap" | indent
+rm -f app/bootstrap.php.cache
+LD_LIBRARY_PATH=$VENDOR_DIR/php/ext ${VENDOR_DIR}/php/bin/php -d date.timezone=UTC -d extension_dir=$VENDOR_DIR/php/ext -d extension=$VENDOR_DIR/php/ext/mbstring.so -d extension=$VENDOR_DIR/php/ext/zlib.so vendor/sensio/distribution-bundle/Sensio/Bundle/DistributionBundle/Resources/bin/build_bootstrap.php | indent 8
+echo "-> Install Assets" | indent
+LD_LIBRARY_PATH=$VENDOR_DIR/php/ext ${VENDOR_DIR}/php/bin/php -d date.timezone=UTC -d extension_dir=$VENDOR_DIR/php/ext -d extension=$VENDOR_DIR/php/ext/mbstring.so -d extension=$VENDOR_DIR/php/ext/zlib.so app/console assets:install web --env=prod | indent 8
+LD_LIBRARY_PATH=$VENDOR_DIR/php/ext ${VENDOR_DIR}/php/bin/php -d date.timezone=UTC -d extension_dir=$VENDOR_DIR/php/ext -d extension=$VENDOR_DIR/php/ext/mbstring.so -d extension=$VENDOR_DIR/php/ext/zlib.so app/console assetic:dump --no-debug --env=prod | indent 8
+
+rm -rf app/cache
+rm -rf app/logs
+mkdir -p apps/cache apps/logs
+rm -f web/config.php
+rm -f web/app_*.php
+
+popd > /dev/null
+
+# Delete sub '.git' folders for each vendor
+pushd $BUILD_DIR > /dev/null
+if [ -d www/vendor ]; then
+    find www/vendor -name .git -type d | xargs rm -rf
+fi
+popd > /dev/null
+
+
+echo "-----> Installing boot script"
+cd $BUILD_DIR
+
+cat >>env.sh <<EOF
+#!/usr/bin/env bash
+export PATH=/app/bin:\$PATH
+export LD_LIBRARY_PATH="/app/php/ext:$LD_LIBRARY_PATH"
+EOF
+chmod +x env.sh
+
+cat >>setup.sh <<EOF
+#!/usr/bin/env bash
+export PATH=/app/bin:\$PATH
+export LD_LIBRARY_PATH="/app/php/ext:$LD_LIBRARY_PATH"
+/app/env.sh
+
+rm -rf /app/www/app/cache /app/www/app/logs
+mkdir /app/www/app/cache
+mkdir /app/www/app/logs
+
+sf2 cache:clear --env=prod
+sf2 cache:warmup --env=prod
+EOF
+chmod +x setup.sh
+
+cat >>web.sh <<EOF
+#!/usr/bin/env bash
+export PATH=/app/bin:\$PATH
+export LD_LIBRARY_PATH="/app/php/ext:$LD_LIBRARY_PATH"
+/app/env.sh
+/app/setup.sh
+
+sed -i 's/Listen 80/Listen '$PORT'/' /app/apache/conf/httpd.conf
+#sed -i 's/^DocumentRoot/# DocumentRoot/' /app/apache/conf/httpd.conf
+sed -i 's/^ServerLimit 1/ServerLimit 16/' /app/apache/conf/httpd.conf
+sed -i 's/^MaxClients 1/MaxClients 16/' /app/apache/conf/httpd.conf
+
 for var in \`env|cut -f1 -d=\`; do
   echo "PassEnv \$var" >> /app/apache/conf/httpd.conf;
 done
+touch /app/www/app/logs/prod.log
+touch /app/www/app/logs/dev.log
+tail -F /app/www/app/logs/prod.log &
+tail -F /app/www/app/logs/dev.log &
 touch /app/apache/logs/error_log
 touch /app/apache/logs/access_log
 tail -F /app/apache/logs/error_log &
 tail -F /app/apache/logs/access_log &
-export LD_LIBRARY_PATH=/app/php/ext
-export PHP_INI_SCAN_DIR=/app/www
 echo "Launching apache"
 exec /app/apache/bin/httpd -DNO_DETACH
 EOF
 
-chmod +x boot.sh
+chmod +x web.sh
 
-# clean the cache
-rm -rf $CACHE_DIR
+echo "-----> Slug compilation ends with success!"
